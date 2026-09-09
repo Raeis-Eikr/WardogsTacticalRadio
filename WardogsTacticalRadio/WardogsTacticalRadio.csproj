@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>WardogsTacticalRadio</AssemblyName>
     <RootNamespace>WardogsTacticalRadio</RootNamespace>
-    <Version>0.1.0-alpha2a</Version>
+    <Version>0.1.0-alpha2b</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.2.1" />

@@ -1,6 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
 $project = Join-Path $PSScriptRoot 'WardogsTacticalRadio\WardogsTacticalRadio.csproj'
+$mainWindow = Join-Path $PSScriptRoot 'WardogsTacticalRadio\MainWindow.xaml.cs'
+$buildNotes = Join-Path $PSScriptRoot 'BUILD_NOTES.md'
 
 if (-not (Test-Path $project)) {
     throw "Project file not found: $project"
@@ -13,6 +15,23 @@ if ([string]::IsNullOrWhiteSpace($version)) {
     throw 'No <Version> value was found in WardogsTacticalRadio.csproj.'
 }
 
+$uiVersion = "v$version"
+
+# Pre-distribution consistency checks. Fail closed if version metadata disagrees.
+if (Test-Path $mainWindow) {
+    $mainText = Get-Content $mainWindow -Raw
+    if ($mainText -notmatch [regex]::Escape($uiVersion)) {
+        throw "Release version mismatch: project reports $version but MainWindow.xaml.cs does not contain $uiVersion."
+    }
+}
+
+if (Test-Path $buildNotes) {
+    $notesText = Get-Content $buildNotes -Raw
+    if ($notesText -notmatch [regex]::Escape($uiVersion)) {
+        throw "Release version mismatch: project reports $version but BUILD_NOTES.md does not contain $uiVersion."
+    }
+}
+
 $packageName = "WardogsRadio_v${version}_Windows_x64"
 $publishRoot = Join-Path $PSScriptRoot 'publish'
 $publishDir = Join-Path $publishRoot $packageName
@@ -22,7 +41,8 @@ if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 New-Item -ItemType Directory -Path $publishDir -Force | Out-Null
 
-Write-Host "Building tester package for v$version..." -ForegroundColor Cyan
+Write-Host "Release consistency check passed for $uiVersion." -ForegroundColor Green
+Write-Host "Building tester package for $uiVersion..." -ForegroundColor Cyan
 
 dotnet publish $project `
   -c Release `

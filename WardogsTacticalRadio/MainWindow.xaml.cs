@@ -13,7 +13,7 @@ public partial class MainWindow : Window
     private AppSettings _settings = new();
     private RadioSessionService? _sessionService;
     private RadioAudioService? _audioService;
-    private const string Version = "v0.1.0-alpha2a";
+    private const string Version = "v0.1.0-alpha2b";
     private string _selectedTxChannel = "SQD";
     private bool _transmitting;
     private CancellationTokenSource? _rxResetCts;
@@ -43,6 +43,7 @@ public partial class MainWindow : Window
         _sessionService.StatusChanged += OnStatusChanged;
         _sessionService.SessionChanged += OnSessionChanged;
         _sessionService.AudioFrameReceived += OnAudioFrameReceived;
+        _sessionService.ConnectionLost += OnConnectionLost;
 
         try
         {
@@ -224,6 +225,26 @@ public partial class MainWindow : Window
         if (state is null) { RxTxLargeText.Text = "STBY"; ActiveCallsignText.Text = "NO ACTIVE TRANSMISSION"; return; }
         RxTxLargeText.Text = _sessionService?.IsHosting == true ? "HOST" : "LINK";
         ActiveCallsignText.Text = $"HOST // {state.HostCallsign}";
+    }
+
+    private void OnConnectionLost(string reason)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            _transmitting = false;
+            NetTitleText.Text = "NET: STANDBY";
+            RxTxLargeText.Text = "LINK LOST";
+            ActiveCallsignText.Text = "HOST UNREACHABLE";
+            SessionIdText.Text = "NET ID: --------";
+            LcdStatusText.Text = reason;
+            LeftStatusText.Text = "● OFFLINE";
+            LeftStatusText.Foreground = (Brush)Application.Current.Resources["Amber"];
+            TxLamp.Fill = new SolidColorBrush(Color.FromRgb(72, 54, 50));
+            RxLamp.Fill = new SolidColorBrush(Color.FromRgb(50, 80, 47));
+            HostButton.IsEnabled = true;
+            JoinButton.IsEnabled = true;
+            AudioStatusText.Text = "AUDIO: LINK LOST // REJOIN OR HOST A NET";
+        });
     }
 
     private void OnStatusChanged(string status)

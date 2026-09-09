@@ -13,6 +13,7 @@ public sealed class RadioSessionService : IAsyncDisposable
 {
     private readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web);
     private readonly List<TcpClient> _clients = new();
+    private readonly Dictionary<TcpClient, Guid> _clientPeerIds = new();
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private TcpListener? _listener;
     private TcpClient? _upstreamClient;
@@ -26,6 +27,7 @@ public sealed class RadioSessionService : IAsyncDisposable
     public event Action<string>? StatusChanged;
     public event Action<RadioSessionState>? SessionChanged;
     public event Action<AudioFrame>? AudioFrameReceived;
+    public event Action<string>? ConnectionLost;
 
     public RadioSessionService(AppSettings settings)
     {
@@ -115,10 +117,11 @@ public sealed class RadioSessionService : IAsyncDisposable
 
     private async Task ReceiveLoopAsync(TcpClient client, CancellationToken cancellationToken)
     {
+        var wasUpstream = ReferenceEquals(client, _upstreamClient);
         try
         {
             using var reader = new StreamReader(client.GetStream(), Encoding.UTF8, false, 4096, leaveOpen: true);
-            while (!cancellationToken.IsCancellationRequested && client.Connected)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 var line = await reader.ReadLineAsync(cancellationToken);
                 if (line is null) break;
@@ -128,12 +131,51 @@ public sealed class RadioSessionService : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { StatusChanged?.Invoke($"LINK LOST // {ex.Message}"); }
+        catch (Exception ex)
+        {
+            if (!cancellationToken.IsCancellationRequested)
+                StatusChanged?.Invoke($"LINK LOST // {ex.Message}");
+        }
         finally
         {
-            lock (_clients) _clients.Remove(client);
+            if (IsHosting)
+            {
+                await RemoveDisconnectedClientAsync(client, cancellationToken);
+            }
+            else if (wasUpstream && !cancellationToken.IsCancellationRequested)
+            {
+                _upstreamClient = null;
+                IsConnected = false;
+                Session = null;
+                ConnectionLost?.Invoke("HOST CONNECTION LOST");
+                StatusChanged?.Invoke("LINK LOST // HOST UNREACHABLE");
+            }
+
+            lock (_clients)
+            {
+                _clients.Remove(client);
+                _clientPeerIds.Remove(client);
+            }
             try { client.Dispose(); } catch { }
         }
+    }
+
+    private async Task RemoveDisconnectedClientAsync(TcpClient client, CancellationToken cancellationToken)
+    {
+        Guid peerId;
+        lock (_clients)
+        {
+            if (!_clientPeerIds.TryGetValue(client, out peerId)) return;
+            _clientPeerIds.Remove(client);
+        }
+
+        if (Session is null) return;
+        var removed = Session.Peers.RemoveAll(p => p.PeerId == peerId) > 0;
+        if (!removed) return;
+
+        SessionChanged?.Invoke(Session);
+        StatusChanged?.Invoke("PEER DISCONNECTED // SESSION UPDATED");
+        try { await BroadcastSessionAsync(cancellationToken); } catch { }
     }
 
     private async Task HandleEnvelopeAsync(TcpClient source, NetworkEnvelope envelope, CancellationToken cancellationToken)
@@ -145,6 +187,10 @@ public sealed class RadioSessionService : IAsyncDisposable
                 var peer = envelope.ReadPayload<RadioPeer>();
                 if (peer is null) return;
                 peer.LastHeartbeatUtc = DateTime.UtcNow;
+
+                lock (_clients)
+                    _clientPeerIds[source] = peer.PeerId;
+
                 Session.Peers.RemoveAll(p => p.PeerId == peer.PeerId);
                 Session.Peers.Add(peer);
                 await SendAsync(source, NetworkEnvelope.Create("session", Session), cancellationToken);
@@ -186,7 +232,7 @@ public sealed class RadioSessionService : IAsyncDisposable
         lock (_clients) snapshot = _clients.ToList();
         foreach (var client in snapshot)
         {
-            if (client == except || !client.Connected) continue;
+            if (client == except) continue;
             try { await SendAsync(client, envelope, cancellationToken); } catch { }
         }
     }
@@ -213,6 +259,7 @@ public sealed class RadioSessionService : IAsyncDisposable
         {
             foreach (var client in _clients) try { client.Dispose(); } catch { }
             _clients.Clear();
+            _clientPeerIds.Clear();
         }
         _listener = null;
         _upstreamClient = null;
