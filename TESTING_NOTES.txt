@@ -1,0 +1,31 @@
+WARDOGS Tactical Radio v0.1.0-alpha2 - Private Test Build
+
+PURPOSE
+This is an early private test build for host/join networking and SQD/CMD voice testing.
+
+RUN
+1. Extract the ZIP completely.
+2. Run WardogsTacticalRadio.exe.
+3. If Windows SmartScreen appears, choose More info > Run anyway only if you received this build directly from the test group.
+4. Allow the app through Windows Firewall on Private networks if prompted.
+
+HOST
+- Click HOST RADIO NET.
+- The default radio port is TCP 47825.
+- For players outside the host's home network, the host may need TCP port 47825 forwarded on the router to the host PC's local IPv4 address.
+
+JOIN
+- Same LAN: enter the host PC's local IPv4 address (for example 192.168.x.x).
+- Internet: enter the host's public IPv4 address.
+- Do not use 127.0.0.1 unless both copies are on the same PC.
+
+VOICE
+- Select SQD or CMD.
+- Hold the on-screen PTT button to transmit.
+- While the app has focus: F9 = SQD PTT, F10 = CMD PTT.
+
+IMPORTANT
+- This is alpha software.
+- Host migration/failover is not active yet.
+- Friends and known-server discovery are not active yet.
+- Do not post the build publicly.

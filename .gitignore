@@ -1,0 +1,25 @@
+# Build output
+bin/
+obj/
+publish/
+
+# Tester packages
+*.zip
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Local runtime/config data
+data/
+logs/
