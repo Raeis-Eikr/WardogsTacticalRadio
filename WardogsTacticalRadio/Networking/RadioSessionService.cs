@@ -14,6 +14,23 @@ using WardogsTacticalRadio.Models;
 
 namespace WardogsTacticalRadio.Networking;
 
+// Wire protocol: every connection is TLS (SslStream) carrying newline-delimited JSON
+// "envelopes" (see NetworkEnvelope). Before any session/audio traffic is trusted, a peer
+// must complete a password-based mutual handshake:
+//
+//   host -> client : "challenge" { nonce }
+//   client -> host : "hello"     { peer info, clientNonce, proof = HMAC(password, hostNonce || channelBinding) }
+//   host -> client : "session-ack" { session state, hostProof = HMAC(password, clientNonce || channelBinding) }
+//                      (or "auth-failed" if the client's proof didn't check out)
+//
+// The password itself is never sent - only an HMAC over a nonce is - and that HMAC is
+// additionally bound to the TLS channel via GetChannelBindingBytes(). That binding is what
+// stops a relay-style MITM (one that terminates TLS itself and presents its own certificate)
+// from riding through the password check even though there's no certificate pinning yet:
+// each side's channel-binding value depends on which certificate *it* actually saw, so an
+// attacker sitting in the middle ends up with two different values on either side of it,
+// which makes the HMAC comparison fail. See ValidateServerCertificate for the corresponding
+// client-side trust decision.
 public sealed class RadioSessionService : IAsyncDisposable
 {
     private const int NonceSizeBytes = 32;
@@ -58,11 +75,18 @@ public sealed class RadioSessionService : IAsyncDisposable
 
     public async Task HostAsync(string sessionName, int port, string password, CancellationToken cancellationToken = default)
     {
+        // Secure by default: hosting used to accept any TCP connection with no credential at
+        // all, which is what let anyone who found the IP:port join, inject audio, or spoof
+        // peers. Requiring a password here (rather than making it optional) closes that gap
+        // unconditionally instead of relying on the host remembering to set one.
         if (string.IsNullOrEmpty(password))
             throw new ArgumentException("A session password is required to host a radio net.", nameof(password));
 
         await StopAsync();
         _passwordKey = Encoding.UTF8.GetBytes(password);
+        // A fresh, ephemeral cert per hosting session is enough for TLS confidentiality/integrity;
+        // it isn't meant to prove identity on its own (see ValidateServerCertificate) since there's
+        // no PKI to issue a "real" one against for a peer-to-peer LAN/internet radio net.
         _hostCertificate = CreateEphemeralServerCertificate();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         Session = new RadioSessionState
@@ -100,6 +124,9 @@ public sealed class RadioSessionService : IAsyncDisposable
             StatusChanged?.Invoke("LINK ENCRYPTED // VERIFYING SESSION PASSWORD");
 
             var reader = new StreamReader(sslStream, Encoding.UTF8, false, 4096, leaveOpen: true);
+            // Fail closed rather than falling back to an unbound proof: without a channel
+            // binding, the HMAC below would only prove "knows the password", not "knows the
+            // password on *this* TLS connection", reopening the relay-MITM gap.
             var channelBinding = GetChannelBindingBytes(sslStream)
                 ?? throw new NotSupportedException("This connection did not provide a TLS channel binding; refusing to authenticate to avoid a relay attack.");
 
@@ -132,6 +159,9 @@ public sealed class RadioSessionService : IAsyncDisposable
                 throw new IOException($"Unexpected message from host during authentication: {ackEnvelope.Type}");
 
             var ack = ackEnvelope.ReadPayload<SessionAck>() ?? throw new IOException("Malformed session response from host.");
+            // Mutual auth: the client already proved it knows the password via `proof` above;
+            // this checks the reverse, so a rogue "host" that doesn't actually know the
+            // password can't feed a joining client a fabricated session/roster.
             var expectedHostProof = ComputeProof(_passwordKey, clientNonce, channelBinding);
             if (!CryptographicOperations.FixedTimeEquals(Convert.FromBase64String(ack.HostProof), expectedHostProof))
                 throw new UnauthorizedAccessException("Host failed to prove knowledge of the session password (possible impersonation).");
@@ -213,6 +243,9 @@ public sealed class RadioSessionService : IAsyncDisposable
             var clientNonce = TryDecodeBase64(hello?.ClientNonce);
             var providedProof = TryDecodeBase64(hello?.Proof);
 
+            // channelBinding is null here only if this platform/TLS session couldn't produce one;
+            // short-circuiting to false (rather than computing the proof without it) means we
+            // never silently downgrade to an unbound comparison.
             var authenticated = hello is not null && channelBinding is not null && clientNonce is not null && providedProof is not null
                 && CryptographicOperations.FixedTimeEquals(ComputeProof(_passwordKey, hostNonce, channelBinding), providedProof);
 
@@ -230,6 +263,9 @@ public sealed class RadioSessionService : IAsyncDisposable
             peer.LastHeartbeatUtc = DateTime.UtcNow;
             var connection = new PeerConnection { Client = tcpClient, Stream = sslStream, Reader = reader, PeerId = peer.PeerId };
 
+            // Multiple clients can complete the handshake concurrently, and List<T> isn't
+            // thread-safe - without this lock, two peers joining at the same instant could
+            // corrupt _connections/Session.Peers or throw a collection-modified exception.
             lock (_connections)
             {
                 _connections.Add(connection);
@@ -322,6 +358,9 @@ public sealed class RadioSessionService : IAsyncDisposable
     {
         switch (envelope.Type)
         {
+            // !IsHosting matters: only a client should ever accept a "session" update from its
+            // upstream host. Without this guard, any authenticated peer could push a forged
+            // "session" envelope to the host and overwrite its own authoritative state.
             case "session" when !IsHosting:
             {
                 var state = envelope.ReadPayload<RadioSessionState>();
@@ -379,6 +418,18 @@ public sealed class RadioSessionService : IAsyncDisposable
         return line is null ? null : JsonSerializer.Deserialize<NetworkEnvelope>(line, _json);
     }
 
+    // There's no PKI to validate the host's certificate against - it's self-signed and
+    // regenerated every hosting session - so this deliberately accepts any certificate
+    // (trust-on-first-use). That's safe against an on-path relay attacker *only* because
+    // ComputeProof binds the password proof to this exact TLS channel via its channel-binding
+    // token: a relay that terminates TLS itself and presents a different certificate ends up
+    // with a different binding value on each side, which fails the proof check even though
+    // each individual TLS handshake succeeded. What this does *not* protect against: nothing
+    // here verifies you're connecting to the host you actually intend. If you're given a wrong
+    // or spoofed address that happens to run a service using the same password (e.g. it
+    // leaked, or is weak/reused), you'll complete a fully valid, non-MITM'd handshake with the
+    // wrong host. Closing that gap needs endpoint verification - e.g. confirming a certificate
+    // fingerprint out-of-band - which is follow-up work, not implemented here.
     private bool ValidateServerCertificate(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors)
     {
         if (sslPolicyErrors != SslPolicyErrors.None)
@@ -391,9 +442,16 @@ public sealed class RadioSessionService : IAsyncDisposable
         using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         var request = new CertificateRequest("CN=WardogsTacticalRadio-EphemeralHost", ecdsa, HashAlgorithmName.SHA256);
         var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(2));
+        // CreateSelfSigned's cert holds an ephemeral (non-persisted) private key, which
+        // SChannel/SslStream can fail to use for TLS server auth on Windows. Exporting and
+        // reimporting as PFX forces a key handle SslStream can actually work with.
         return new X509Certificate2(certificate.Export(X509ContentType.Pfx));
     }
 
+    // Returns a value derived from the certificate seen on this specific TLS connection
+    // (RFC 5929 "tls-server-end-point"). Both sides land on the same value only when they're
+    // really talking to each other with no one splitting the TLS connection in between - see
+    // ValidateServerCertificate for why that property matters here.
     private static byte[]? GetChannelBindingBytes(SslStream stream)
     {
         try
@@ -410,6 +468,9 @@ public sealed class RadioSessionService : IAsyncDisposable
         }
     }
 
+    // The password itself never goes on the wire, only this HMAC over a single-use nonce plus
+    // the channel binding - so it can't be replayed on a different connection or reused to
+    // derive the password.
     private static byte[] ComputeProof(byte[] passwordKey, byte[] nonce, byte[] channelBinding)
     {
         using var hmac = new HMACSHA256(passwordKey);

@@ -60,6 +60,8 @@ public partial class MainWindow : Window
 
         try
         {
+            // See GlobalPttHotkeys for why this uses a raw keyboard hook instead of WPF's
+            // (focus-scoped) PreviewKeyDown/Up.
             _hotkeys = new GlobalPttHotkeys([Key.F9, Key.F10]);
             _hotkeys.KeyDown += OnHotkeyDown;
             _hotkeys.KeyUp += OnHotkeyUp;
@@ -74,6 +76,9 @@ public partial class MainWindow : Window
         SelectTxChannel("SQD");
     }
 
+    // Hook callbacks already run on this (UI) thread's message loop, so Dispatcher.Invoke is
+    // just defensive here - it's a no-op re-entry, not a cross-thread marshal - kept in case
+    // hook installation ever moves off the UI thread.
     private void OnHotkeyDown(Key key)
     {
         Dispatcher.Invoke(() =>
@@ -183,6 +188,9 @@ public partial class MainWindow : Window
         ResetToIdle();
     }
 
+    // Resets the UI to idle after a deliberate disconnect. OnConnectionLost below handles the
+    // same "no active session" end state for an unexpected drop, with its own distinct
+    // messaging ("LINK LOST" vs a plain idle screen).
     private void ResetToIdle()
     {
         _transmitting = false;

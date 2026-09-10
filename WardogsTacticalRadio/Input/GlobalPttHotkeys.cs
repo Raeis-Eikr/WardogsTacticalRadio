@@ -4,6 +4,12 @@ using System.Windows.Input;
 
 namespace WardogsTacticalRadio.Input;
 
+// Push-to-talk needs both a key-down and a key-up while the app may not have focus (it's meant
+// to run alongside a game). Win32's RegisterHotKey only reports "pressed", not release, so a
+// low-level keyboard hook is used instead - the same mechanism Discord/TeamSpeak/Mumble use for
+// PTT. This also sidesteps a WPF quirk where F10 arrives via KeyEventArgs.SystemKey rather than
+// .Key (a holdover from F10 historically activating the menu bar), since here we read the raw
+// virtual-key code directly instead of going through WPF's routed key events at all.
 public sealed class GlobalPttHotkeys : IDisposable
 {
     private const int WH_KEYBOARD_LL = 13;
