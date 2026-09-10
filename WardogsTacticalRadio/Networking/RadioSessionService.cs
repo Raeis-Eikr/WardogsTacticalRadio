@@ -1,7 +1,12 @@
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Authentication.ExtendedProtection;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using WardogsTacticalRadio.Audio;
@@ -11,13 +16,24 @@ namespace WardogsTacticalRadio.Networking;
 
 public sealed class RadioSessionService : IAsyncDisposable
 {
+    private const int NonceSizeBytes = 32;
+
+    private sealed class PeerConnection
+    {
+        public required TcpClient Client { get; init; }
+        public required SslStream Stream { get; init; }
+        public required StreamReader Reader { get; init; }
+        public Guid PeerId { get; init; }
+    }
+
     private readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web);
-    private readonly List<TcpClient> _clients = new();
-    private readonly Dictionary<TcpClient, Guid> _clientPeerIds = new();
+    private readonly List<PeerConnection> _connections = new();
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private TcpListener? _listener;
-    private TcpClient? _upstreamClient;
+    private PeerConnection? _upstream;
     private CancellationTokenSource? _cts;
+    private X509Certificate2? _hostCertificate;
+    private byte[] _passwordKey = Array.Empty<byte>();
 
     public bool IsHosting { get; private set; }
     public bool IsConnected { get; private set; }
@@ -40,9 +56,14 @@ public sealed class RadioSessionService : IAsyncDisposable
         };
     }
 
-    public async Task HostAsync(string sessionName, int port, CancellationToken cancellationToken = default)
+    public async Task HostAsync(string sessionName, int port, string password, CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrEmpty(password))
+            throw new ArgumentException("A session password is required to host a radio net.", nameof(password));
+
         await StopAsync();
+        _passwordKey = Encoding.UTF8.GetBytes(password);
+        _hostCertificate = CreateEphemeralServerCertificate();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         Session = new RadioSessionState
         {
@@ -56,24 +77,80 @@ public sealed class RadioSessionService : IAsyncDisposable
         _listener.Start();
         IsHosting = true;
         IsConnected = true;
-        StatusChanged?.Invoke($"HOSTING // {GetBestLanAddress()}:{port}");
+        StatusChanged?.Invoke($"HOSTING // {GetBestLanAddress()}:{port} // ENCRYPTED + PASSWORD PROTECTED");
         SessionChanged?.Invoke(Session);
         _ = AcceptLoopAsync(_cts.Token);
     }
 
-    public async Task JoinAsync(string address, int port, CancellationToken cancellationToken = default)
+    public async Task JoinAsync(string address, int port, string password, CancellationToken cancellationToken = default)
     {
         await StopAsync();
+        _passwordKey = Encoding.UTF8.GetBytes(password);
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var client = new TcpClient { NoDelay = true };
-        StatusChanged?.Invoke($"CONNECTING // {address}:{port}");
-        await client.ConnectAsync(address, port, _cts.Token);
-        _upstreamClient = client;
-        IsConnected = true;
+        var token = _cts.Token;
 
-        await SendAsync(client, NetworkEnvelope.Create("hello", LocalPeer), _cts.Token);
-        _ = ReceiveLoopAsync(client, _cts.Token);
-        StatusChanged?.Invoke("CONNECTED // awaiting session sync");
+        var tcpClient = new TcpClient { NoDelay = true };
+        StatusChanged?.Invoke($"CONNECTING // {address}:{port}");
+        await tcpClient.ConnectAsync(address, port, token);
+
+        SslStream sslStream = new(tcpClient.GetStream(), leaveInnerStreamOpen: false, ValidateServerCertificate);
+        try
+        {
+            await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = address }, token);
+            StatusChanged?.Invoke("LINK ENCRYPTED // VERIFYING SESSION PASSWORD");
+
+            var reader = new StreamReader(sslStream, Encoding.UTF8, false, 4096, leaveOpen: true);
+            var channelBinding = GetChannelBindingBytes(sslStream)
+                ?? throw new NotSupportedException("This connection did not provide a TLS channel binding; refusing to authenticate to avoid a relay attack.");
+
+            var challengeEnvelope = await ReadEnvelopeAsync(reader, token)
+                ?? throw new IOException("Host closed the connection before presenting an authentication challenge.");
+            if (challengeEnvelope.Type != "challenge")
+                throw new IOException("Host did not present an authentication challenge.");
+            var challenge = challengeEnvelope.ReadPayload<ChallengeMessage>()
+                ?? throw new IOException("Malformed authentication challenge from host.");
+            var hostNonce = Convert.FromBase64String(challenge.Nonce);
+
+            var clientNonce = RandomNumberGenerator.GetBytes(NonceSizeBytes);
+            var proof = ComputeProof(_passwordKey, hostNonce, channelBinding);
+            var hello = new HelloRequest
+            {
+                Peer = LocalPeer,
+                ClientNonce = Convert.ToBase64String(clientNonce),
+                Proof = Convert.ToBase64String(proof)
+            };
+            await SendAsync(sslStream, NetworkEnvelope.Create("hello", hello), token);
+
+            var ackEnvelope = await ReadEnvelopeAsync(reader, token)
+                ?? throw new IOException("Host closed the connection during authentication.");
+            if (ackEnvelope.Type == "auth-failed")
+            {
+                var failure = ackEnvelope.ReadPayload<AuthFailedMessage>();
+                throw new UnauthorizedAccessException(failure?.Reason ?? "Incorrect session password.");
+            }
+            if (ackEnvelope.Type != "session-ack")
+                throw new IOException($"Unexpected message from host during authentication: {ackEnvelope.Type}");
+
+            var ack = ackEnvelope.ReadPayload<SessionAck>() ?? throw new IOException("Malformed session response from host.");
+            var expectedHostProof = ComputeProof(_passwordKey, clientNonce, channelBinding);
+            if (!CryptographicOperations.FixedTimeEquals(Convert.FromBase64String(ack.HostProof), expectedHostProof))
+                throw new UnauthorizedAccessException("Host failed to prove knowledge of the session password (possible impersonation).");
+
+            var connection = new PeerConnection { Client = tcpClient, Stream = sslStream, Reader = reader, PeerId = LocalPeer.PeerId };
+            _upstream = connection;
+            IsConnected = true;
+            Session = ack.Session;
+            SessionChanged?.Invoke(Session);
+            StatusChanged?.Invoke($"CONNECTED // NET SYNC // {Session.SessionName}");
+
+            _ = ReceiveLoopAsync(connection, token);
+        }
+        catch
+        {
+            try { sslStream.Dispose(); } catch { }
+            try { tcpClient.Dispose(); } catch { }
+            throw;
+        }
     }
 
     public async Task TransmitAudioAsync(string channelId, byte[] pcm16, CancellationToken cancellationToken = default)
@@ -92,9 +169,9 @@ public sealed class RadioSessionService : IAsyncDisposable
         {
             await BroadcastAsync(envelope, null, cancellationToken);
         }
-        else if (_upstreamClient is { Connected: true })
+        else if (_upstream is { Client.Connected: true } upstream)
         {
-            await SendAsync(_upstreamClient, envelope, cancellationToken);
+            await SendAsync(upstream.Stream, envelope, cancellationToken);
         }
     }
 
@@ -105,29 +182,102 @@ public sealed class RadioSessionService : IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var client = await _listener.AcceptTcpClientAsync(cancellationToken);
-                client.NoDelay = true;
-                lock (_clients) _clients.Add(client);
-                _ = ReceiveLoopAsync(client, cancellationToken);
+                var tcpClient = await _listener.AcceptTcpClientAsync(cancellationToken);
+                tcpClient.NoDelay = true;
+                _ = AuthenticateAndAcceptClientAsync(tcpClient, cancellationToken);
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { StatusChanged?.Invoke($"HOST ERROR // {ex.Message}"); }
     }
 
-    private async Task ReceiveLoopAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task AuthenticateAndAcceptClientAsync(TcpClient tcpClient, CancellationToken cancellationToken)
     {
-        var wasUpstream = ReferenceEquals(client, _upstreamClient);
+        SslStream? sslStream = null;
         try
         {
-            using var reader = new StreamReader(client.GetStream(), Encoding.UTF8, false, 4096, leaveOpen: true);
+            sslStream = new SslStream(tcpClient.GetStream(), leaveInnerStreamOpen: false);
+            await sslStream.AuthenticateAsServerAsync(
+                new SslServerAuthenticationOptions { ServerCertificate = _hostCertificate, ClientCertificateRequired = false },
+                cancellationToken);
+
+            var reader = new StreamReader(sslStream, Encoding.UTF8, false, 4096, leaveOpen: true);
+            var channelBinding = GetChannelBindingBytes(sslStream);
+
+            var hostNonce = RandomNumberGenerator.GetBytes(NonceSizeBytes);
+            await SendAsync(sslStream, NetworkEnvelope.Create("challenge", new ChallengeMessage { Nonce = Convert.ToBase64String(hostNonce) }), cancellationToken);
+
+            var helloEnvelope = await ReadEnvelopeAsync(reader, cancellationToken);
+            if (helloEnvelope is null || helloEnvelope.Type != "hello") { Discard(tcpClient, sslStream); return; }
+            var hello = helloEnvelope.ReadPayload<HelloRequest>();
+            var clientNonce = TryDecodeBase64(hello?.ClientNonce);
+            var providedProof = TryDecodeBase64(hello?.Proof);
+
+            var authenticated = hello is not null && channelBinding is not null && clientNonce is not null && providedProof is not null
+                && CryptographicOperations.FixedTimeEquals(ComputeProof(_passwordKey, hostNonce, channelBinding), providedProof);
+
+            if (!authenticated)
+            {
+                await SendAsync(sslStream, NetworkEnvelope.Create("auth-failed", new AuthFailedMessage { Reason = "Invalid session password." }), cancellationToken);
+                StatusChanged?.Invoke($"AUTH REJECTED // {SafeRemoteEndpoint(tcpClient)}");
+                Discard(tcpClient, sslStream);
+                return;
+            }
+
+            if (Session is null) { Discard(tcpClient, sslStream); return; }
+
+            var peer = hello!.Peer;
+            peer.LastHeartbeatUtc = DateTime.UtcNow;
+            var connection = new PeerConnection { Client = tcpClient, Stream = sslStream, Reader = reader, PeerId = peer.PeerId };
+
+            lock (_connections)
+            {
+                _connections.Add(connection);
+                Session.Peers.RemoveAll(p => p.PeerId == peer.PeerId);
+                Session.Peers.Add(peer);
+            }
+
+            var hostProof = ComputeProof(_passwordKey, clientNonce!, channelBinding!);
+            await SendAsync(sslStream, NetworkEnvelope.Create("session-ack", new SessionAck { Session = Session, HostProof = Convert.ToBase64String(hostProof) }), cancellationToken);
+            await BroadcastSessionAsync(cancellationToken, except: connection);
+            SessionChanged?.Invoke(Session);
+            StatusChanged?.Invoke($"LINKED // {peer.Callsign}");
+
+            await ReceiveLoopAsync(connection, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            Discard(tcpClient, sslStream);
+        }
+        catch (Exception ex)
+        {
+            StatusChanged?.Invoke($"HANDSHAKE FAILED // {ex.Message}");
+            Discard(tcpClient, sslStream);
+        }
+    }
+
+    private static void Discard(TcpClient client, SslStream? stream)
+    {
+        try { stream?.Dispose(); } catch { }
+        try { client.Dispose(); } catch { }
+    }
+
+    private static string SafeRemoteEndpoint(TcpClient client)
+    {
+        try { return client.Client.RemoteEndPoint?.ToString() ?? "unknown"; }
+        catch { return "unknown"; }
+    }
+
+    private async Task ReceiveLoopAsync(PeerConnection connection, CancellationToken cancellationToken)
+    {
+        var wasUpstream = ReferenceEquals(connection, _upstream);
+        try
+        {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var line = await reader.ReadLineAsync(cancellationToken);
-                if (line is null) break;
-                var envelope = JsonSerializer.Deserialize<NetworkEnvelope>(line, _json);
-                if (envelope is null) continue;
-                await HandleEnvelopeAsync(client, envelope, cancellationToken);
+                var envelope = await ReadEnvelopeAsync(connection.Reader, cancellationToken);
+                if (envelope is null) break;
+                await HandleEnvelopeAsync(connection, envelope, cancellationToken);
             }
         }
         catch (OperationCanceledException) { }
@@ -140,37 +290,27 @@ public sealed class RadioSessionService : IAsyncDisposable
         {
             if (IsHosting)
             {
-                await RemoveDisconnectedClientAsync(client, cancellationToken);
+                await RemoveDisconnectedClientAsync(connection, cancellationToken);
             }
             else if (wasUpstream && !cancellationToken.IsCancellationRequested)
             {
-                _upstreamClient = null;
+                _upstream = null;
                 IsConnected = false;
                 Session = null;
                 ConnectionLost?.Invoke("HOST CONNECTION LOST");
                 StatusChanged?.Invoke("LINK LOST // HOST UNREACHABLE");
             }
 
-            lock (_clients)
-            {
-                _clients.Remove(client);
-                _clientPeerIds.Remove(client);
-            }
-            try { client.Dispose(); } catch { }
+            lock (_connections) _connections.Remove(connection);
+            Discard(connection.Client, connection.Stream);
         }
     }
 
-    private async Task RemoveDisconnectedClientAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task RemoveDisconnectedClientAsync(PeerConnection connection, CancellationToken cancellationToken)
     {
-        Guid peerId;
-        lock (_clients)
-        {
-            if (!_clientPeerIds.TryGetValue(client, out peerId)) return;
-            _clientPeerIds.Remove(client);
-        }
-
         if (Session is null) return;
-        var removed = Session.Peers.RemoveAll(p => p.PeerId == peerId) > 0;
+        bool removed;
+        lock (_connections) removed = Session.Peers.RemoveAll(p => p.PeerId == connection.PeerId) > 0;
         if (!removed) return;
 
         SessionChanged?.Invoke(Session);
@@ -178,28 +318,11 @@ public sealed class RadioSessionService : IAsyncDisposable
         try { await BroadcastSessionAsync(cancellationToken); } catch { }
     }
 
-    private async Task HandleEnvelopeAsync(TcpClient source, NetworkEnvelope envelope, CancellationToken cancellationToken)
+    private async Task HandleEnvelopeAsync(PeerConnection source, NetworkEnvelope envelope, CancellationToken cancellationToken)
     {
         switch (envelope.Type)
         {
-            case "hello" when IsHosting && Session is not null:
-            {
-                var peer = envelope.ReadPayload<RadioPeer>();
-                if (peer is null) return;
-                peer.LastHeartbeatUtc = DateTime.UtcNow;
-
-                lock (_clients)
-                    _clientPeerIds[source] = peer.PeerId;
-
-                Session.Peers.RemoveAll(p => p.PeerId == peer.PeerId);
-                Session.Peers.Add(peer);
-                await SendAsync(source, NetworkEnvelope.Create("session", Session), cancellationToken);
-                await BroadcastSessionAsync(cancellationToken);
-                SessionChanged?.Invoke(Session);
-                StatusChanged?.Invoke($"LINKED // {peer.Callsign}");
-                break;
-            }
-            case "session":
+            case "session" when !IsHosting:
             {
                 var state = envelope.ReadPayload<RadioSessionState>();
                 if (state is null) return;
@@ -220,54 +343,108 @@ public sealed class RadioSessionService : IAsyncDisposable
         }
     }
 
-    private async Task BroadcastSessionAsync(CancellationToken cancellationToken)
+    private async Task BroadcastSessionAsync(CancellationToken cancellationToken, PeerConnection? except = null)
     {
         if (Session is null) return;
-        await BroadcastAsync(NetworkEnvelope.Create("session", Session), null, cancellationToken);
+        await BroadcastAsync(NetworkEnvelope.Create("session", Session), except, cancellationToken);
     }
 
-    private async Task BroadcastAsync(NetworkEnvelope envelope, TcpClient? except, CancellationToken cancellationToken)
+    private async Task BroadcastAsync(NetworkEnvelope envelope, PeerConnection? except, CancellationToken cancellationToken)
     {
-        List<TcpClient> snapshot;
-        lock (_clients) snapshot = _clients.ToList();
-        foreach (var client in snapshot)
+        List<PeerConnection> snapshot;
+        lock (_connections) snapshot = _connections.ToList();
+        foreach (var connection in snapshot)
         {
-            if (client == except) continue;
-            try { await SendAsync(client, envelope, cancellationToken); } catch { }
+            if (connection == except) continue;
+            try { await SendAsync(connection.Stream, envelope, cancellationToken); } catch { }
         }
     }
 
-    private async Task SendAsync(TcpClient client, NetworkEnvelope envelope, CancellationToken cancellationToken)
+    private async Task SendAsync(Stream stream, NetworkEnvelope envelope, CancellationToken cancellationToken)
     {
         var json = JsonSerializer.Serialize(envelope, _json) + "\n";
         var bytes = Encoding.UTF8.GetBytes(json);
         await _sendGate.WaitAsync(cancellationToken);
         try
         {
-            await client.GetStream().WriteAsync(bytes, cancellationToken);
-            await client.GetStream().FlushAsync(cancellationToken);
+            await stream.WriteAsync(bytes, cancellationToken);
+            await stream.FlushAsync(cancellationToken);
         }
         finally { _sendGate.Release(); }
+    }
+
+    private async Task<NetworkEnvelope?> ReadEnvelopeAsync(StreamReader reader, CancellationToken cancellationToken)
+    {
+        var line = await reader.ReadLineAsync(cancellationToken);
+        return line is null ? null : JsonSerializer.Deserialize<NetworkEnvelope>(line, _json);
+    }
+
+    private bool ValidateServerCertificate(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors sslPolicyErrors)
+    {
+        if (sslPolicyErrors != SslPolicyErrors.None)
+            StatusChanged?.Invoke("LINK ENCRYPTED // HOST CERTIFICATE NOT INDEPENDENTLY VERIFIED (NO PKI) // RELYING ON SESSION PASSWORD");
+        return certificate is not null;
+    }
+
+    private static X509Certificate2 CreateEphemeralServerCertificate()
+    {
+        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest("CN=WardogsTacticalRadio-EphemeralHost", ecdsa, HashAlgorithmName.SHA256);
+        var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(2));
+        return new X509Certificate2(certificate.Export(X509ContentType.Pfx));
+    }
+
+    private static byte[]? GetChannelBindingBytes(SslStream stream)
+    {
+        try
+        {
+            using var binding = stream.TransportContext.GetChannelBinding(ChannelBindingKind.Endpoint);
+            if (binding is null || binding.IsInvalid || binding.Size <= 0) return null;
+            var bytes = new byte[binding.Size];
+            Marshal.Copy(binding.DangerousGetHandle(), bytes, 0, binding.Size);
+            return bytes;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static byte[] ComputeProof(byte[] passwordKey, byte[] nonce, byte[] channelBinding)
+    {
+        using var hmac = new HMACSHA256(passwordKey);
+        var buffer = new byte[nonce.Length + channelBinding.Length];
+        Buffer.BlockCopy(nonce, 0, buffer, 0, nonce.Length);
+        Buffer.BlockCopy(channelBinding, 0, buffer, nonce.Length, channelBinding.Length);
+        return hmac.ComputeHash(buffer);
+    }
+
+    private static byte[]? TryDecodeBase64(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return null;
+        try { return Convert.FromBase64String(value); }
+        catch (FormatException) { return null; }
     }
 
     public async Task StopAsync()
     {
         _cts?.Cancel();
         try { _listener?.Stop(); } catch { }
-        try { _upstreamClient?.Dispose(); } catch { }
-        lock (_clients)
+        try { if (_upstream is not null) Discard(_upstream.Client, _upstream.Stream); } catch { }
+        lock (_connections)
         {
-            foreach (var client in _clients) try { client.Dispose(); } catch { }
-            _clients.Clear();
-            _clientPeerIds.Clear();
+            foreach (var connection in _connections) Discard(connection.Client, connection.Stream);
+            _connections.Clear();
         }
         _listener = null;
-        _upstreamClient = null;
+        _upstream = null;
         _cts?.Dispose();
         _cts = null;
         IsHosting = false;
         IsConnected = false;
         Session = null;
+        _hostCertificate?.Dispose();
+        _hostCertificate = null;
         await Task.CompletedTask;
     }
 

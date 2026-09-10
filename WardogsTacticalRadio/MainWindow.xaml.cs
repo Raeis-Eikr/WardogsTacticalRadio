@@ -113,10 +113,15 @@ public partial class MainWindow : Window
     private async void HostButton_Click(object sender, RoutedEventArgs e)
     {
         if (_sessionService is null) return;
+        if (string.IsNullOrEmpty(HostPasswordBox.Password))
+        {
+            SetStatus("HOST FAILED // A SESSION PASSWORD IS REQUIRED", false);
+            return;
+        }
         try
         {
             HostButton.IsEnabled = false; JoinButton.IsEnabled = false;
-            await _sessionService.HostAsync(HostSessionNameBox.Text, _settings.ListenPort);
+            await _sessionService.HostAsync(HostSessionNameBox.Text, _settings.ListenPort, HostPasswordBox.Password);
             RememberSession(HostSessionNameBox.Text, $"{RadioSessionService.GetBestLanAddress()}:{_settings.ListenPort}");
         }
         catch (Exception ex) { SetStatus($"HOST FAILED // {ex.Message}", false); HostButton.IsEnabled = true; JoinButton.IsEnabled = true; }
@@ -130,7 +135,7 @@ public partial class MainWindow : Window
             HostButton.IsEnabled = false; JoinButton.IsEnabled = false;
             var address = JoinAddressBox.Text.Trim();
             if (string.IsNullOrWhiteSpace(address)) address = "127.0.0.1";
-            await _sessionService.JoinAsync(address, _settings.ListenPort);
+            await _sessionService.JoinAsync(address, _settings.ListenPort, JoinPasswordBox.Password);
             RememberSession("Joined Radio Net", $"{address}:{_settings.ListenPort}");
         }
         catch (Exception ex) { SetStatus($"JOIN FAILED // {ex.Message}", false); HostButton.IsEnabled = true; JoinButton.IsEnabled = true; }
