@@ -122,6 +122,7 @@ public partial class MainWindow : Window
         {
             HostButton.IsEnabled = false; JoinButton.IsEnabled = false;
             await _sessionService.HostAsync(HostSessionNameBox.Text, _settings.ListenPort, HostPasswordBox.Password);
+            DisconnectButton.IsEnabled = true;
             RememberSession(HostSessionNameBox.Text, $"{RadioSessionService.GetBestLanAddress()}:{_settings.ListenPort}");
         }
         catch (Exception ex) { SetStatus($"HOST FAILED // {ex.Message}", false); HostButton.IsEnabled = true; JoinButton.IsEnabled = true; }
@@ -136,9 +137,36 @@ public partial class MainWindow : Window
             var address = JoinAddressBox.Text.Trim();
             if (string.IsNullOrWhiteSpace(address)) address = "127.0.0.1";
             await _sessionService.JoinAsync(address, _settings.ListenPort, JoinPasswordBox.Password);
+            DisconnectButton.IsEnabled = true;
             RememberSession("Joined Radio Net", $"{address}:{_settings.ListenPort}");
         }
         catch (Exception ex) { SetStatus($"JOIN FAILED // {ex.Message}", false); HostButton.IsEnabled = true; JoinButton.IsEnabled = true; }
+    }
+
+    private async void DisconnectButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_sessionService is null) return;
+        DisconnectButton.IsEnabled = false;
+        await _sessionService.StopAsync();
+        ResetToIdle();
+    }
+
+    private void ResetToIdle()
+    {
+        _transmitting = false;
+        NetTitleText.Text = "NET: STANDBY";
+        RxTxLargeText.Text = "STBY";
+        ActiveCallsignText.Text = "NO ACTIVE TRANSMISSION";
+        SessionIdText.Text = "NET ID: --------";
+        LcdStatusText.Text = "SIG: ----   NET: 0   HOST: NONE";
+        LeftStatusText.Text = "● OFFLINE";
+        LeftStatusText.Foreground = (Brush)Application.Current.Resources["Amber"];
+        TxLamp.Fill = new SolidColorBrush(Color.FromRgb(72, 54, 50));
+        RxLamp.Fill = new SolidColorBrush(Color.FromRgb(50, 80, 47));
+        HostButton.IsEnabled = true;
+        JoinButton.IsEnabled = true;
+        DisconnectButton.IsEnabled = false;
+        AudioStatusText.Text = "AUDIO: READY // F9 SQD / F10 CMD";
     }
 
     private void CmdButton_Click(object sender, RoutedEventArgs e) => SelectTxChannel("CMD");
@@ -248,6 +276,7 @@ public partial class MainWindow : Window
             RxLamp.Fill = new SolidColorBrush(Color.FromRgb(50, 80, 47));
             HostButton.IsEnabled = true;
             JoinButton.IsEnabled = true;
+            DisconnectButton.IsEnabled = false;
             AudioStatusText.Text = "AUDIO: LINK LOST // REJOIN OR HOST A NET";
         });
     }
