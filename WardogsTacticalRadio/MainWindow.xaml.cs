@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using WardogsTacticalRadio.Audio;
+using WardogsTacticalRadio.Input;
 using WardogsTacticalRadio.Models;
 using WardogsTacticalRadio.Networking;
 using WardogsTacticalRadio.Storage;
@@ -13,6 +14,7 @@ public partial class MainWindow : Window
     private AppSettings _settings = new();
     private RadioSessionService? _sessionService;
     private RadioAudioService? _audioService;
+    private GlobalPttHotkeys? _hotkeys;
     private const string Version = "v0.1.0-alpha2b";
     private string _selectedTxChannel = "SQD";
     private bool _transmitting;
@@ -23,8 +25,6 @@ public partial class MainWindow : Window
         InitializeComponent();
         Loaded += MainWindow_Loaded;
         Closing += MainWindow_Closing;
-        PreviewKeyDown += MainWindow_PreviewKeyDown;
-        PreviewKeyUp += MainWindow_PreviewKeyUp;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -57,7 +57,39 @@ public partial class MainWindow : Window
             AudioStatusText.Text = $"AUDIO: ERROR ({ex.Message})";
             AudioStatusText.Foreground = (Brush)Application.Current.Resources["Red"];
         }
+
+        try
+        {
+            _hotkeys = new GlobalPttHotkeys([Key.F9, Key.F10]);
+            _hotkeys.KeyDown += OnHotkeyDown;
+            _hotkeys.KeyUp += OnHotkeyUp;
+            _hotkeys.Start();
+        }
+        catch (Exception ex)
+        {
+            AudioStatusText.Text = $"HOTKEYS: ERROR ({ex.Message}) // USE ON-SCREEN PTT";
+            AudioStatusText.Foreground = (Brush)Application.Current.Resources["Red"];
+        }
+
         SelectTxChannel("SQD");
+    }
+
+    private void OnHotkeyDown(Key key)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            if (key == Key.F9) { SelectTxChannel("SQD"); BeginTransmit("SQD"); }
+            else if (key == Key.F10) { SelectTxChannel("CMD"); BeginTransmit("CMD"); }
+        });
+    }
+
+    private void OnHotkeyUp(Key key)
+    {
+        Dispatcher.Invoke(() =>
+        {
+            if ((key == Key.F9 && _selectedTxChannel == "SQD") || (key == Key.F10 && _selectedTxChannel == "CMD"))
+                EndTransmit();
+        });
     }
 
     private void PopulateSocialPanels()
@@ -190,18 +222,6 @@ public partial class MainWindow : Window
     private void PttButton_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e) { BeginTransmit(_selectedTxChannel); PttButton.CaptureMouse(); e.Handled = true; }
     private void PttButton_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e) { EndTransmit(); PttButton.ReleaseMouseCapture(); e.Handled = true; }
 
-    private void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
-    {
-        if (e.IsRepeat) return;
-        if (e.Key == Key.F9) { SelectTxChannel("SQD"); BeginTransmit("SQD"); e.Handled = true; }
-        else if (e.Key == Key.F10 && CanUseCommandNet()) { SelectTxChannel("CMD"); BeginTransmit("CMD"); e.Handled = true; }
-    }
-
-    private void MainWindow_PreviewKeyUp(object sender, KeyEventArgs e)
-    {
-        if ((e.Key == Key.F9 && _selectedTxChannel == "SQD") || (e.Key == Key.F10 && _selectedTxChannel == "CMD")) { EndTransmit(); e.Handled = true; }
-    }
-
     private void BeginTransmit(string channel)
     {
         if (_sessionService?.IsConnected != true) { AudioStatusText.Text = "AUDIO: JOIN OR HOST A NET FIRST"; return; }
@@ -327,6 +347,7 @@ public partial class MainWindow : Window
     private async void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
         _rxResetCts?.Cancel();
+        _hotkeys?.Dispose();
         _audioService?.Dispose();
         if (_sessionService is not null) await _sessionService.DisposeAsync();
         await AppSettingsStore.SaveAsync(_settings);
