@@ -28,3 +28,9 @@ jobs:
           -c Release -r win-x64 --self-contained true
           -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
           -o publish-check
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: WardogsTacticalRadio-win-x64
+          path: publish-check/
